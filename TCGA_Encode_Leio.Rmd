@@ -1,0 +1,526 @@
+
+```{r, setup}
+  library(TCGAbiolinks)
+  library(tidyverse)
+  library(DESeq2)
+  library(ggpubr)
+  library(ComplexHeatmap)
+  library(clusterProfiler)
+
+ID_convert <- read_tsv(
+    "GDCdata/TCGA-SARC/Transcriptome_Profiling/Gene_Expression_Quantification/00b84393-53e7-4a0a-8fa1-3a641bd0c8ac/a51683df-e7cb-4c81-b0ff-d7d8ae08e113.rna_seq.augmented_star_gene_counts.tsv", skip =1) |> 
+  dplyr::filter(str_detect(gene_id, "ENSG")) |> 
+  dplyr::select(gene_id, gene_name)
+
+ID_converter <- read_tsv("/media/alessio/Data/genome110/ID_SYMBOL_converter.tsv") |> 
+  select(gene_id, symbol)
+```
+
+
+```{r}
+#Analisi su tutti i tipi di leiomyosarcoma
+
+#creo la query e scarico tutti i file (a differenza della pagina web non si può filtrare per leiomyosarcoma,
+#quindi scarica tutte le count matrix del progetto TCGA-SARC
+
+Query = GDCquery(
+  project = "TCGA-SARC",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  data.format = "tsv",
+  workflow.type = "STAR - Counts",
+  sample.type = c("Primary Tumor")
+)
+
+#GDCdownload(Query, files.per.chunk = 50)
+
+#scarico i dati che mi permottono di associare il nome del file al tipo di sarcoma, dato che voglio analizzare solo il leio
+#e avere il dato sul tessuto in cui si è formato
+
+data = GDCprepare(Query)
+
+coldata <- as.data.frame(colData(data))
+
+Count_matrix_all <- as.data.frame(assay(data, "unstranded"))
+```
+
+
+```{r}
+#filtro sul Leio
+coldata_Leio <- coldata |> 
+  dplyr::filter(definition == "Primary solid Tumor" & specimen_type == "Solid Tissue" & primary_diagnosis == "Leiomyosarcoma, NOS") |> 
+  dplyr::select(definition, specimen_type, primary_diagnosis, barcode, tissue_or_organ_of_origin)
+
+#Summary sui tessuti di origine
+summary_tissue_Leio <- coldata_Leio |> 
+  group_by(tissue_or_organ_of_origin) |> 
+  summarise(Count = n())
+
+#totalmente diversi rispetto al portale GDC web
+#Vado avanti così
+
+#Modifico le annotazioni sul tessuto di origne mettendo "other" su tutti i tessuti che hanno solo un campione
+#Questo in modo da semplificare i dati e permettermi di creare un design con DESeq2
+
+summary_tissue_Leio_redefined <- summary_tissue_Leio |> 
+  dplyr::mutate(redefinition = ifelse(Count > 1, tissue_or_organ_of_origin, "Other"))
+
+coldata_Leio_redefined <- coldata_Leio |> 
+  left_join(summary_tissue_Leio_redefined, by = "tissue_or_organ_of_origin")
+
+#seleziono solo i campioni leio
+Count_matrix_Leio <- Count_matrix_all |> 
+  dplyr::select(coldata_Leio_redefined$barcode)
+```
+
+
+```{r}
+#DESeq
+dds <- DESeqDataSetFromMatrix(Count_matrix_Leio,
+  colData = coldata_Leio_redefined, 
+  design = ~ redefinition)
+
+#Se voglio fare senza design per avere solo le conte normalizzate:
+#https://support.bioconductor.org/p/125781/ metodo suggerito da Love stesso
+
+dds <- DESeq(dds)
+
+vst <- vst(dds)
+
+PCA <- plotPCA(vst, intgroup = "redefinition", ntop = 500) +
+  stat_ellipse(level = 0.8)
+
+#ggsave(PCA, filename = "PCA_leio_TCGA.png", dpi = 300, height = 12, width = 12)
+```
+
+
+```{r}
+#Conte normalizzate e vst
+Norm_counts <- as.data.frame(counts(dds, normalized = T))
+Vst_counts <- as.data.frame(assay(vst))
+
+Norm_counts <- Norm_counts |> 
+  rownames_to_column(var = "gene_id") |> 
+  left_join(ID_convert, by = "gene_id") |> 
+  dplyr::filter(!is.na(gene_name) & !duplicated(gene_name)) |> 
+  dplyr::select(!gene_id) |> 
+  column_to_rownames(var = "gene_name")
+
+Vst_counts <- Vst_counts |> 
+  rownames_to_column(var = "gene_id") |> 
+  left_join(ID_convert, by = "gene_id") |> 
+  dplyr::filter(!is.na(gene_name) & !duplicated(gene_name)) |> 
+  dplyr::select(!gene_id) |> 
+  column_to_rownames(var = "gene_name")
+```
+
+
+```{r}
+#####################
+#Heatmap HDACs Vst
+HDACs = paste0("HDAC", 1:11)
+HDACs_vst <- Vst_counts[row.names(Vst_counts) %in% HDACs, ]
+
+# HDAC_MEFs = row.names(Vst_counts)[str_detect(row.names(Vst_counts), "^HDAC|^MEF2")]
+# HDAC_MEFs_vst <- Vst_counts[row.names(Vst_counts) %in% HDAC_MEFs, ]
+
+
+ha <- coldata_Leio_redefined |> dplyr::select(barcode, redefinition) |> 
+  column_to_rownames(var = "barcode") |> 
+  dplyr::arrange(redefinition)
+
+Heatmap(HDACs_vst[, row.names(ha)], 
+  top_annotation = HeatmapAnnotation(Tissues = ha$redefinition),
+  row_dend_reorder = TRUE,
+  cluster_columns = T,
+  name = "VSD",
+  col = c("white", "blue"))
+```
+
+```{r}
+
+####################################
+#plot_correlation HDACs EPAS1/HIF1A
+Vst_df <- Vst_counts |> 
+  as.data.frame() |> 
+  rownames_to_column(var = "symbol") |> 
+  pivot_longer(cols = !symbol, names_to = "Sample", values_to = "VSD")
+
+
+Corr_plot_list <- list()
+
+for (j in c("HIF1A", "EPAS1")) {
+  
+  for (i in HDACs) {
+
+    pippoh = paste0(j,"-",i)
+
+    Vst_df_f <- Vst_df |> 
+      dplyr::filter(symbol %in% c(i, j)) |> 
+      pivot_wider(names_from = symbol, values_from = VSD) |> 
+      dplyr::arrange(j)
+  
+    #print(df_f)
+  
+    plot <- Vst_df_f %>%
+      ggplot(aes(x = .data[[i]], y = .data[[j]])) +
+      geom_point() +
+      geom_smooth(method = "lm") +
+      stat_cor(method = "pearson") +
+      labs(
+        x = paste0(i, " (VSD)"),
+        y = paste0(j, " (VSD)"),
+        title = j
+      ) +
+      theme_bw()
+  
+
+    Corr_plot_list[[pippoh]] <- plot
+  }
+}
+```
+
+
+```{r}
+
+Corr_plot_list$`HIF1A-HDAC1`
+Corr_plot_list$`HIF1A-HDAC2`
+Corr_plot_list$`HIF1A-HDAC3`
+Corr_plot_list$`HIF1A-HDAC4`
+Corr_plot_list$`HIF1A-HDAC5`
+Corr_plot_list$`HIF1A-HDAC6`
+Corr_plot_list$`HIF1A-HDAC7`
+Corr_plot_list$`HIF1A-HDAC8`
+Corr_plot_list$`HIF1A-HDAC9`
+Corr_plot_list$`HIF1A-HDAC10`
+Corr_plot_list$`HIF1A-HDAC11`
+
+Corr_plot_list$`EPAS1-HDAC1`
+Corr_plot_list$`EPAS1-HDAC2`
+Corr_plot_list$`EPAS1-HDAC3`
+Corr_plot_list$`EPAS1-HDAC4`
+Corr_plot_list$`EPAS1-HDAC5`
+Corr_plot_list$`EPAS1-HDAC6`
+Corr_plot_list$`EPAS1-HDAC7`
+Corr_plot_list$`EPAS1-HDAC8`
+Corr_plot_list$`EPAS1-HDAC9`
+Corr_plot_list$`EPAS1-HDAC10`
+Corr_plot_list$`EPAS1-HDAC11`
+
+ggsave(Corr_plot_list$`HIF1A-HDAC4`, filename = "HIF1A_HDAC4.png", dpi = 300, height = 4, width = 6)
+ggsave(Corr_plot_list$`HIF1A-HDAC5`, filename = "HIF1A_HDAC5.png", dpi = 300, height = 4, width = 6)
+ggsave(Corr_plot_list$`EPAS1-HDAC4`, filename = "EPAS1_HDAC4.png", dpi = 300, height = 4, width = 6)
+ggsave(Corr_plot_list$`EPAS1-HDAC5`, filename = "EPAS1_HDAC5.png", dpi = 300, height = 4, width = 6)
+
+ggsave(Corr_plot_list$`EPAS1-HDAC2`, filename = "EPAS1_HDAC2.png", dpi = 300, height = 4, width = 6)
+```
+
+```{r}
+library(msigdbr)
+Msigdb = msigdbr(species = "Homo sapiens")
+```
+
+```{r}
+
+###################################
+#Pathway Msigdb in relazione a geni
+
+Correlation_pathway_HDAC <- function(HDAC, pathway) {
+
+  Pathway_genes = dplyr::filter(Msigdb, gs_name == pathway) |> 
+    dplyr::select(human_gene_symbol) |> 
+    unlist() |> 
+    unique()
+
+  Vst_df_pathway = Vst_df |> 
+  dplyr::filter(symbol %in% Pathway_genes) |> 
+  group_by(Sample) |> 
+  dplyr::summarize(
+    mean = mean(VSD)
+  )
+
+  Vst_HDAC <- Vst_df[Vst_df$symbol == HDAC, ]
+
+  Vst_merged <- left_join(Vst_df_pathway, Vst_HDAC, by = "Sample")
+
+  Plot <- ggplot(Vst_merged, aes(x = VSD, y = mean)) +
+  geom_point() +
+      geom_smooth(method = "lm") +
+      stat_cor(method = "pearson") +
+      labs(
+        x = paste0(HDAC," (VSD)"),
+        y = paste0(pathway," (mean VSD)")) +
+      theme_bw()
+
+  return(Plot)
+}
+
+HDAC5_H_HPX <- Correlation_pathway_HDAC("HDAC5", "HALLMARK_HYPOXIA")
+HDAC4_H_HPX <- Correlation_pathway_HDAC("HDAC4", "HALLMARK_HYPOXIA")
+
+#ggsave(HDAC5_H_HPX, filename = "HDAC5_HPX_H.png", dpi = 300, height = 4, width = 6)
+#ggsave(HDAC4_H_HPX, filename = "HDAC4_HPX_H.png", dpi = 300, height = 4, width = 6)
+
+
+HDAC_H_RCS <- Correlation_pathway_HDAC("HDAC4", "REACTOME_CELLULAR_SENESCENCE")
+HDAC5_BUFFA_HPX <- Correlation_pathway_HDAC("HDAC5", "BUFFA_HYPOXIA_METAGENE")
+HDAC4_BUFFA_HPX <- Correlation_pathway_HDAC("HDAC4", "BUFFA_HYPOXIA_METAGENE")
+HDAC9_BUFFA_HPX <- Correlation_pathway_HDAC("HDAC9", "BUFFA_HYPOXIA_METAGENE")
+
+#ggsave(HDAC5_BUFFA_HPX, filename = "HDAC5_BUFFA_HPX.png", dpi = 300, height = 4, width = 6)
+#ggsave(HDAC4_BUFFA_HPX, filename = "HDAC4_BUFFA_HPX.png", dpi = 300, height = 4, width = 6)
+```
+
+```{r}
+
+################################
+#Heatmap su pathway di ipossia
+
+#Ricreo una matrice con lo Zscore su ogni gene
+Zscore_matrix <- t(apply(Vst_counts, MARGIN = 1, function(x) (x - mean(x)) / sd(x))) |> as.matrix()
+
+MakeHeatmap_on_Pathway <- function(Matrix, pathway, Gene) {
+
+  Pathway_genes = dplyr::filter(Msigdb, gs_name == pathway) |> 
+    dplyr::select(human_gene_symbol) |> 
+    unlist() |> 
+    unique()
+
+  Matrix_filtered <- Matrix[row.names(Matrix) %in% Pathway_genes, ] 
+
+  Gene_Matrix <- Matrix[row.names(Matrix) %in% Gene, ]
+  
+  colfunc <- circlize::colorRamp2(c(-abs(max(na.omit(Matrix_filtered))) *0.75, 0, abs(max(na.omit(Matrix_filtered)))* 0.75),
+  c("Darkblue", "white", "red"))
+
+  # colfunc <- circlize::colorRamp2(c(0, abs(max(na.omit(Matrix_filtered)))),
+  # c("white", "red"))
+
+  Heatmapp1 <- Heatmap(matrix = na.omit(Matrix_filtered),
+    top_annotation = HeatmapAnnotation(Tissues = ha$redefinition),
+    name = "Zscore",
+    col = colfunc,
+    heatmap_legend_param = list(
+    color_bar = "continuous"),
+    show_column_names = F, row_names_gp = gpar(fontsize = 4), column_km = 3, row_title = paste0(pathway, "(VSD)"))
+
+  Heatmapp2 <- Heatmap(matrix = Gene_Matrix,
+    name = "Zscore",
+    col = colfunc,
+    heatmap_legend_param = list(
+    color_bar = "continuous"),
+    height = unit(2, "cm"), cluster_rows = F, show_column_names = F, row_title = "HDACs")
+  
+  Heatmapp <-  Heatmapp1 %v% Heatmapp2
+  
+  return(Heatmapp)
+}
+```
+
+```{r}
+Hmap_H_HPX_HDACs <- MakeHeatmap_on_Pathway(Zscore_matrix, "HALLMARK_HYPOXIA", c("HDAC4", "HDAC5", "HDAC7", "HDAC9"))
+Hmap_H_HPX_HDACs
+
+Hmap_Buffa_HDACs <- MakeHeatmap_on_Pathway(Zscore_matrix, "BUFFA_HYPOXIA_METAGENE", c("HDAC4", "HDAC5", "HDAC7", "HDAC9"))
+Hmap_Buffa_HDACs
+
+# MakeHeatmap_on_Pathway(Zscore_matrix, "GOBP_HYPOXIA_INDUCIBLE_FACTOR_1ALPHA_SIGNALING_PATHWAY", c("HDAC4", "HDAC5", "HDAC7", "HDAC9"))
+# MakeHeatmap_on_Pathway(Zscore_matrix, "ELVIDGE_HIF1A_AND_HIF2A_TARGETS_UP", c("HDAC4", "HDAC5", "HDAC7", "HDAC9"))
+
+# png(filename = "Hmap_H_HPX_HDACs.png", res = 300, height = 30, width = 40, units = "cm")
+# Hmap_H_HPX_HDACs
+# dev.off()
+
+# png(filename = "Hmap_Buffa_HDACs.png", res = 300, height = 30, width = 40, units = "cm")
+# Hmap_Buffa_HDACs
+# dev.off()
+```
+
+
+
+#################################
+#Integrazione con i dai di ENCODE
+```{r}
+
+#Carico i file di ENCODE RNA su smooth muscle cells
+ENCODE_RNAseq_SMC_files <- list.files("ENCODE_RNAseq_SMC", pattern = "EN", full.names = T)
+
+ENCODE_SMC_counts <- tibble()
+
+suppressMessages({
+
+for (i in ENCODE_RNAseq_SMC_files) {
+  
+  name <- basename(i)
+
+  df <- read_tsv(i) |> 
+    dplyr::mutate(Sample = name) |> 
+    dplyr::select("gene_id", "expected_count", "Sample")
+
+  ENCODE_SMC_counts <- bind_rows(ENCODE_SMC_counts, df)
+}
+
+})
+
+
+#sistemo dataframe e cambio i gene_id
+ENCODE_SMC_counts <-  ENCODE_SMC_counts |> 
+  pivot_wider(names_from = "Sample", values_from = "expected_count") |> 
+  mutate(gene_id = str_remove(gene_id, "\\..*")) |> 
+  left_join(ID_converter, by = "gene_id") |> 
+  filter(!is.na(symbol) & !duplicated(symbol)) |> 
+  select(-gene_id)
+
+
+#Unisco insieme con i dati di TCGA e faccio analisi differenziale
+Leio_Raw_counts <- Count_matrix_Leio |> 
+  rownames_to_column(var = "gene_id") |> 
+  left_join(ID_convert, by = "gene_id") |> 
+  dplyr::filter(!is.na(gene_name) & !duplicated(gene_name)) |> 
+  dplyr::select(!gene_id)
+
+
+Leio_SMC_Raw_counts <- left_join(x = Leio_Raw_counts, y = ENCODE_SMC_counts, join_by("gene_name" == "symbol")) |> 
+  column_to_rownames("gene_name") |> 
+  as.matrix()
+
+#converto NA in 0
+Leio_SMC_Raw_counts[is.na(Leio_SMC_Raw_counts)] <- 0
+
+Leio_SMC_coldata <- tibble(
+  Sample = colnames(Leio_SMC_Raw_counts)
+) |> 
+  mutate(Condition = ifelse(str_detect(Sample, "TCGA"), "Tumor", "Normal"))
+
+Leio_SMC_coldata |> 
+  group_by(Condition) |> 
+  summarise(Count = n())
+```
+
+
+```{r}
+
+dds_Leio_SMC <- DESeqDataSetFromMatrix(countData = round(Leio_SMC_Raw_counts), colData = Leio_SMC_coldata, design = ~ Condition)
+
+keep <- rowSums(counts(dds_Leio_SMC) >= 10) >= 9
+dds_Leio_SMC <- dds_Leio_SMC[keep,]
+
+dds_Leio_SMC <- DESeq(dds_Leio_SMC)
+
+vst_Leio_SMC <- vst(dds_Leio_SMC)
+
+PCA_Leio_SMC <- plotPCA(vst_Leio_SMC, intgroup = "Condition")
+#ggsave(PCA_Leio_SMC, filename = "PCA_Leio_SMC.png", height = 6, width = 7)
+
+#Results
+Results <- results(dds_Leio_SMC, name = "Condition_Tumor_vs_Normal")
+#Results_lfc <- lfcShrink(dds_Leio_SMC, coef="Condition_Tumor_vs_Normal", type="apeglm")
+
+plotMA(Results)
+#plotMA(Results_lfc)
+
+summary(Results)
+#summary(Results_lfc)
+```
+
+
+```{r}
+
+Results_Tab <- as.data.frame(Results) |> 
+  dplyr::mutate(Def = case_when(
+    (log2FoldChange > 1 & padj < 0.01) ~ "Up",
+    (log2FoldChange < -1 & padj < 0.01) ~ "Down",
+    TRUE ~ "ns"
+  ))
+
+DEGs_summary <- Results_Tab |> 
+  group_by(Def) |> 
+  summarise(Count = n())
+
+Volcano <- Results_Tab |> 
+  ggplot(aes(x = log2FoldChange, y = -log10(pvalue), color = Def)) +
+  geom_point() +
+  annotate(geom = "text", x = 20, y = 200, label = DEGs_summary[["Count"]][2]) +
+  annotate(geom = "text", x = -20, y = 200, label = DEGs_summary[["Count"]][1]) +
+  scale_color_manual(values = c("Up" = "red", "ns" = "black", "Down" = "blue")) +
+  labs(subtitle = paste0("DEGs\n","padj < 0.01 & L2FC > 1"))
+
+print(Volcano)
+
+#ggsave(Volcano, filename = "Volcano_Leio_vs_SMC.png", dpi =300, width = 8, height = 6)
+
+```
+
+
+```{r}
+#Heatmap
+Hypoxia_genes <- Msigdb |> dplyr::filter(gs_name == "BUFFA_HYPOXIA_METAGENE") |> dplyr::select(gene_symbol) |> unique() |> unlist() |> as.vector()
+
+Heatmap_Hypoxia <- Results_Tab |> 
+  rownames_to_column(var = "symbol") |> 
+  dplyr::filter(symbol %in% Hypoxia_genes) |>
+  dplyr::mutate(log2FoldChange = ifelse(padj < 0.05, log2FoldChange, NA)) |> 
+  ggplot(aes(y = symbol, x =1, fill = log2FoldChange)) +
+  geom_tile(color = "black") +
+  scale_fill_gradient2(low="blue", mid = "white", high="red", midpoint = 0, na.value = "lightgrey") +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      panel.grid = element_blank(),        
+      panel.border = element_blank(),    
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      axis.text = element_text(size = 15),
+      legend.text = element_text(size = 10),
+      axis.text.x = element_text(angle = 90),
+      panel.background = element_rect(
+        fill = "white", color = NA
+      )
+    ) +
+    coord_fixed()
+
+print(Heatmap_Hypoxia)
+```
+
+
+```{r}
+#Norm counts plot HDACs e altri geni
+Norm_Counts_Leio_SMC <- assay(dds_Leio_SMC, normalized = T) |> as.data.frame()
+Vst_Counts_Leio_SMC <- assay(vst_Leio_SMC) |>  as.data.frame()
+
+Vst_Counts_Leio_SMC_long <- Vst_Counts_Leio_SMC |>
+  rownames_to_column(var = "symbol") |> 
+  pivot_longer(cols = !symbol, names_to = "Sample", values_to = "Counts") |> 
+  left_join(Leio_SMC_coldata, by = "Sample")
+
+HDACs <- paste0("HDAC", 1:11)
+HIFs <- c("HIF1A", "EPAS1", "HIF3A", "HIF1A-AS3")
+MEF <- c("MEF2A", "MEF2D", "MEF2C")
+
+library(ggpubr)
+
+Boxplot <- function(df, Genes) {
+  plot <- df |> 
+    dplyr::filter(symbol %in% Genes) |> 
+    dplyr::arrange(symbol) |> 
+    ggplot(aes(x =  symbol, y = Counts, fill = Condition)) +
+    geom_boxplot(width = 0.7) +
+    stat_summary(fun.y="mean", shape = 7, position = position_dodge(width = 0.7), size = 1.5) +
+    scale_fill_viridis_d(option = "C", begin = 0.4) +
+    facet_wrap(~ symbol, scales = "free") +
+    labs(y = "VSD counts") +
+    stat_compare_means(method = "wilcox.test")
+
+  return(plot)
+}
+
+Boxplot_HDACs_Leio_SMC <-  Boxplot(Vst_Counts_Leio_SMC_long, HDACs) + ggtitle("HDACs")
+Boxplot_HIFs_Leio_SMC <- Boxplot(Vst_Counts_Leio_SMC_long, HIFs) + 
+    facet_wrap(~ symbol, scales = "free", nrow = 1) +
+    ggtitle("HIFs")
+Boxplot_MEF_Leio_SMC <- Boxplot(Vst_Counts_Leio_SMC_long, MEF) +
+    ggtitle("MEF")
+
+ggsave(Boxplot_HDACs_Leio_SMC, filename = "Boxplot_HDACs_Leio_SMC.png", dpi = 300, height = 10, width = 12)
+ggsave(Boxplot_HIFs_Leio_SMC, filename = "Boxplot_HIFs_Leio_SMC.png", dpi = 300, height = 6, width = 12)
+ggsave(Boxplot_MEF_Leio_SMC, filename = "Boxplot_MEF_Leio_SMC.png", dpi = 300, height = 6, width = 12)
+```

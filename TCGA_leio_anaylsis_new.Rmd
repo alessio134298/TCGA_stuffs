@@ -1,0 +1,292 @@
+```{r setup}
+library(tidyverse)
+library(DESeq2)
+library(pheatmap)
+
+# Case ID is the link between the rnaseq file and the data in clinical 
+samplesheet <- read_tsv('manual_downloaded_samples/gdc_sample_sheet.2025-09-19.tsv') |> 
+    dplyr::select(`File Name`, `Case ID`)
+```
+
+# Load data and normalize with DESEq2
+```{r}
+files <- list.files('manual_downloaded_samples/rnaseq', recursive = T, pattern = '.tsv', full.names = T)
+
+tab <- tibble()
+
+for (data in files) {
+  df <- read_delim(data, comment = '#', skip = 6, col_names = F)
+  df <- df |> 
+    dplyr::select(X2, X4) |> 
+    dplyr::rename('symbol' = 'X2', 'Raw_counts' = 'X4') |> 
+    mutate(sample = basename(data)) |> 
+    dplyr::filter(!duplicated(symbol))
+  
+  tab <- bind_rows(tab, df)
+}
+
+tab_wide <- tab |> 
+  pivot_wider(names_from = sample, values_from = Raw_counts)
+
+
+# substitution of the column names from the .tsv file to the case ID
+# re-naming
+tab_wide_renamed <- tab_wide |> 
+    pivot_longer(cols = contains('.tsv'), names_to = 'File Name', values_to = 'Counts') |> 
+    left_join(samplesheet, by = 'File Name') |> 
+    dplyr::select(-`File Name`) |> 
+    pivot_wider(names_from = 'Case ID', values_from = 'Counts')
+
+
+# DESEq to have the normalized counts, then to compute the zscore across gene of interest
+coldata <- tibble(samples = colnames(tab_wide_renamed |> column_to_rownames("symbol")))
+
+dds <- DESeqDataSetFromMatrix(countData = tab_wide_renamed |> column_to_rownames("symbol"),
+                              colData = coldata,
+                              design = ~ 1)
+
+dds <- DESeq(dds)
+vst <- vst(dds, blind = T)
+
+vst_counts <- as.data.frame(assay(vst)) |> 
+  rownames_to_column('symbol')
+```
+
+
+```{r}
+write_csv(vst_counts, "vst_counts_TGCA_leio.csv")
+```
+
+# Compute Zscore clustering with kmeans and Heatmap
+```{r}
+vst_counts <- vst_counts |>
+    column_to_rownames('symbol')
+
+# Zscore
+Zscore_tab <- t(scale(t(vst_counts)))
+
+
+# Seelect HDAC and MEF genes
+genes <- c('MEF2B', 'HDAC7', 'MEF2C', 'HDAC4', 'MEF2A', 'HDAC5', 'MEF2D', 'HDAC9')
+Zscore_mef_hdac <- Zscore_tab[genes, ] |> 
+    as.data.frame()
+```
+
+### Kmeans
+```{r}
+# first transpose because we want to clusterize samples
+Zscore_mef_hdac_transposed <- t(Zscore_mef_hdac)
+
+# elbow
+wss <- numeric()
+k_values <- 2:10
+
+for (k in k_values) {
+    set.seed(10)
+    km <- kmeans(Zscore_mef_hdac_transposed,
+                centers = k,
+                nstart = 25, algorithm = c("MacQueen"))
+    wss[k-1] <- km$tot.withinss
+}
+
+plot(k_values, wss, type = 'b', pch = 19)
+
+# result is not clear bu I arbitrary choose 3 :)
+kmeans_samples <- kmeans(Zscore_mef_hdac_transposed, centers = 3, nstart = 25)
+
+# clusters of samples 
+kmeans_samples$cluster
+
+# for the heatmap
+ordered_samples <- rownames(Zscore_mef_hdac_transposed)[order(kmeans_samples$cluster)]
+annotation_row <- data.frame(Cluster = factor(kmeans_samples$cluster[ordered_samples]))
+rownames(annotation_row) <- ordered_samples
+```
+
+
+### Heatmap Z score
+```{r}
+paletteLength <- 50
+myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+# length(breaks) == length(paletteLength) + 1
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(Zscore_mef_hdac), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(Zscore_mef_hdac)/paletteLength, max(Zscore_mef_hdac), length.out=floor(paletteLength/2)))
+
+# Plot the heatmap
+# png('Heatmap_leio_TCGA_HDAC_MEF.png', res = 600, units = 'cm', height = 35, width = 10)
+pheatmap(Zscore_mef_hdac_transposed, 
+         show_colnames = T,
+         show_rownames = F,
+         cluster_rows = T,
+         cluster_cols = F,
+         annotation_row = annotation_row,
+         main = 'Zscore',
+         color=myColor,
+         breaks=myBreaks,
+         cellwidth = 10,
+        cellheight = 5)
+# dev.off()
+```
+
+# Heatmap correlation
+```{r}
+
+# Heatmap correlations between zscore
+genes <- c('MEF2B', 'HDAC7', 'MEF2C', 'HDAC4', 'MEF2A', 'HDAC5', 'MEF2D', 'HDAC9', 'HIF1A', 'EPAS1')
+
+Zscore_mef_hdac_hif <- Zscore_tab[genes, ]
+cor_mat <- cor(t(Zscore_mef_hdac_hif))
+
+paletteLength <- 50
+myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+# length(breaks) == length(paletteLength) + 1
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(-1, 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(1/paletteLength, 1, length.out=floor(paletteLength/2)))
+
+# png('Corr_heatmap_TCGA_HDAC_MEF.png', res = 600, units = 'cm', height = 10, width = 10)
+pheatmap(cor_mat[genes, genes],
+         show_colnames = T,          
+         cluster_rows = F,
+         cluster_cols = F,
+         main = 'Pearson corr',
+         cellwidth = 15,
+         cellheight = 15,
+         color=myColor,
+         breaks=myBreaks)
+# dev.off()
+```
+
+# We want to see if the group with low expression of both HDACs and mEF is correlated with more survival
+```{r}
+# clinical data
+
+# The cluster with less expression is cluster 2
+annotation_row_df <- annotation_row |> 
+    as.data.frame() |> 
+    rownames_to_column('cases.submitter_id')
+
+clinical <- read_tsv('manual_downloaded_samples/clinical.tsv')
+
+# select only the variables of interests
+clinical_unique <- clinical |> 
+  dplyr::filter(!duplicated(cases.case_id)) |> 
+  dplyr::select(cases.submitter_id, demographic.days_to_death, diagnoses.days_to_last_follow_up, demographic.vital_status)
+
+# convert survival time e status
+clinical_unique$time <- ifelse(clinical_unique$demographic.days_to_death == '\'--', 
+                                clinical_unique$diagnoses.days_to_last_follow_up,
+                                clinical_unique$demographic.days_to_death)
+
+clinical_unique$status <- ifelse(clinical_unique$demographic.vital_status == "Dead", 1, 0)
+
+# add the Kmeans group and filter those with no infos of the time
+
+clinical_unique <- clinical_unique |> 
+    left_join(annotation_row_df, by = 'cases.submitter_id') |> 
+    dplyr::filter(time != '\'--') |> 
+    dplyr::mutate(time = as.numeric(time))
+
+clinical_unique$Cluster <- factor(clinical_unique$Cluster)
+```
+# Kaplan meier
+```{r}
+library(survival)
+library(survminer)
+
+fit <- survfit(Surv(time, status) ~ Cluster, data = clinical_unique)
+
+# png('survival_kmeans_MEF_HDAC_leio.png', height = 12, width = 16, units = 'cm', res = 300)
+ggsurvplot(fit,
+           pval = TRUE,
+           conf.int = F,
+           risk.table = F,
+           legend.title = '',
+           palette = c("#7FDC96", "#FF6D62", "#5F99EA"),
+           ggtheme =   theme_bw()
+)
+# dev.off()
+```
+# Relationship between the core 33 genes signature and publica data
+### TCGA data leio
+### heatmap correlation about the signature 33 genes and HDAC MEF
+```{r}
+core_genes <- c(read_lines('../hypoxia/DBR_analysis_RNAseq_new/Genes_Up_shared_DBR_promoter.txt'), 'NFIA', 'NFIC', 'NFIX')
+core_genes <- core_genes[core_genes %in% rownames(Zscore_tab)]
+
+
+genes_HDAC_MEF <- c('HDAC4', 'HDAC5', 'HDAC7', 'HDAC9', 'MEF2A', 'MEF2B', 'MEF2C', 'MEF2D')
+total_genes <- c(core_genes, genes_HDAC_MEF) 
+# Heatmap correlations between zscore
+
+
+Zscore_33_genes_HDC_MEF <- Zscore_tab[total_genes, ]
+
+library(Hmisc)
+res <- rcorr(t(Zscore_33_genes_HDC_MEF), type = 'pearson')
+cor_mat <- res$r
+p_mat <- res$P
+
+# cor_mat[p_mat >= 0.05] <- 0
+
+cor_mat_selected <- cor_mat[core_genes, genes_HDAC_MEF]
+
+paletteLength <- 50
+myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+# length(breaks) == length(paletteLength) + 1
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(-1, 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(1/paletteLength, 1, length.out=floor(paletteLength/2)))
+
+H <- pheatmap(cor_mat_selected,
+         show_colnames = T,          
+         cluster_rows = T,
+         cluster_cols = T,
+         main = 'Pearson corr',
+         color=myColor,
+         breaks=myBreaks)
+```
+# Broad institute data ccle (a lot of cell lines)
+```{r}
+core_genes <- c(read_lines('../hypoxia/DBR_analysis_RNAseq_new/Genes_Up_shared_DBR_promoter.txt'), 'NFIA', 'NFIC', 'NFIX')
+core_genes <- core_genes[core_genes %in% rownames(Zscore_ccle)]
+genes_HDAC_MEF <- c('HDAC4', 'HDAC5', 'HDAC7', 'HDAC9', 'MEF2A', 'MEF2B', 'MEF2C', 'MEF2D')
+total_genes <- c(core_genes, genes_HDAC_MEF) 
+
+ccle_RNAseq_genes_counts <- read_delim("/media/alessio/Data/Public_data_TCGA_ENCODE_cBioportal/CCLE_RNAseq_genes_counts_20180929.gct", skip = 2) #questo da BroadInstitute https://depmap.org/portal/data_page/?tab=allData
+ccle_RNAseq_genes_counts <- ccle_RNAseq_genes_counts %>% 
+  dplyr::select(-Name) %>% 
+  dplyr::filter(!duplicated(Description) & !is.na(Description)) %>% 
+  column_to_rownames("Description") %>% 
+  as.matrix()
+
+Zscore_ccle <- t(scale(t(ccle_RNAseq_genes_counts)))
+
+Zscore_ccle_33_genes_HDC_MEF <- Zscore_ccle[total_genes, ]
+
+library(Hmisc)
+res <- rcorr(t(Zscore_ccle_33_genes_HDC_MEF), type = 'spearman')
+cor_mat <- res$r
+p_mat <- res$P
+
+# cor_mat[p_mat >= 0.05] <- 0
+
+cor_mat_selected <- cor_mat[core_genes, genes_HDAC_MEF]
+
+paletteLength <- 50
+myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+# length(breaks) == length(paletteLength) + 1
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(-0.5, 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(1/paletteLength, 0.5, length.out=floor(paletteLength/2)))
+
+G <- pheatmap(cor_mat_selected,
+         show_colnames = T,          
+         cluster_rows = T,
+         cluster_cols = T,
+         main = 'Pearson corr',
+         color=myColor,
+         breaks=myBreaks)
+```
+
